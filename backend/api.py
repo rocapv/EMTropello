@@ -15,12 +15,16 @@ import json
 import math
 import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
+import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+
+from . import poller
 
 ROOT = Path(__file__).resolve().parent.parent
 DB = ROOT / "data" / "emt.db"
@@ -35,6 +39,38 @@ _NET_CACHE: dict | None = None
 MATCH_MAX_M = 3000     # radi per lligar un bus amb la seua posició de la pasada anterior
 MIN_DT_SEC = 40        # la pasada "anterior" ha de ser >= això d'antiga (si no, el GPS
                        # d'EMT no ha refrescat i eixiria velocitat 0 -> tot parat)
+
+# --- Pull ON-DEMAND: NO hi ha poller de fons. El geoportal només es consulta quan
+# un client demana /api/buses i la caché ha caducat (~1 min). Sense clients, zero
+# consultes. Diversos clients comparteixen la mateixa caché (1 pull/min com a molt).
+CACHE_TTL = 55                          # segons de validesa de la caché (~1 pull/min)
+_fetch_session = requests.Session()
+_fetch_lock = threading.Lock()
+poller.init_db().close()                # assegura les taules (ja no ho fa el poller)
+
+
+def _ensure_fresh() -> None:
+    """Si la última pasada tiene > CACHE_TTL, consulta el geoportal (una sola vez,
+    aunque haya varios clientes) y la guarda. Si no, no hace nada (sirve caché)."""
+    con = _con()
+    try:
+        last = con.execute("SELECT ts FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()
+        if last and int(time.time()) - last["ts"] < CACHE_TTL:
+            return
+        if not _fetch_lock.acquire(blocking=False):
+            # otro hilo ya está consultando el geoportal; servimos lo que haya
+            return
+        try:
+            last = con.execute("SELECT ts FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()
+            if last and int(time.time()) - last["ts"] < CACHE_TTL:
+                return
+            poller.poll_once(con, _fetch_session)
+        except Exception as e:  # noqa: BLE001 - si el geoportal falla, servimos la última buena
+            print("ensure_fresh error:", e)
+        finally:
+            _fetch_lock.release()
+    finally:
+        con.close()
 
 
 def _token() -> str:
@@ -80,8 +116,10 @@ async def auth_token(request: Request, call_next):
 
 
 def _con() -> sqlite3.Connection:
-    con = sqlite3.connect(DB)
+    con = sqlite3.connect(DB, timeout=10)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")     # lectors i escriptor concurrents
+    con.execute("PRAGMA busy_timeout=10000")
     return con
 
 
@@ -109,6 +147,7 @@ def _mdist(a_lat, a_lng, b_lat, b_lng) -> float:
 
 @app.get("/api/buses")
 def buses():
+    _ensure_fresh()          # pull on-demand al geoportal si la caché ha caducat
     con = _con()
     cur, prev = _cur_prev_snapshots(con)
     if not cur:
