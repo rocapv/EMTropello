@@ -37,7 +37,61 @@ const lineasVisibles = new Set();
 const lineasVistas = new Set();
 const stopsLayer = L.layerGroup();  // parades (visibles en acostar el zoom)
 const STOP_ZOOM = 14;               // a partir d'ací es mostren les parades
+// índex espacial de la ruta de cada línia, per "enganxar" el bus a la via
+const lineSegs = {};                // code -> [{a:[lat,lng], b:[lat,lng]}]
+const lineGrid = {};                // code -> Map(cel·la -> [idx de segment])
+const CELL = 0.0006;                // ~55 m en latitud
+const SNAP_MAX_M = 55;              // si el bus està més lluny de la via, no s'enganxa
 let ultimoTs = 0, ultimoPts = 0, edadSeg = 0;
+
+function indexarRuta(code, paths) {
+  const segs = [], grid = new Map();
+  for (const path of paths) {
+    for (let i = 0; i + 1 < path.length; i++) {
+      const idx = segs.length;
+      segs.push({ a: path[i], b: path[i + 1] });
+      for (const p of [path[i], path[i + 1]]) {
+        const k = Math.round(p[0] / CELL) + "|" + Math.round(p[1] / CELL);
+        let arr = grid.get(k);
+        if (!arr) grid.set(k, arr = []);
+        if (arr[arr.length - 1] !== idx) arr.push(idx);
+      }
+    }
+  }
+  lineSegs[code] = segs; lineGrid[code] = grid;
+}
+// projecta p sobre el segment a-b (pla local escalant lng per cos(lat))
+function projSeg(p, a, b) {
+  const cf = Math.cos(p[0] * Math.PI / 180);
+  const ax = a[1] * cf, ay = a[0], bx = b[1] * cf, by = b[0], px = p[1] * cf, py = p[0];
+  const dx = bx - ax, dy = by - ay, L2 = dx * dx + dy * dy;
+  let t = L2 ? ((px - ax) * dx + (py - ay) * dy) / L2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  const qx = ax + t * dx, qy = ay + t * dy;
+  return { point: [qy, qx / cf], dist: Math.hypot(px - qx, py - qy) * 111000, a, b };
+}
+// millor punt de la via de la línia més pròxim a ll (o null)
+function snapToLine(code, ll) {
+  const grid = lineGrid[code], segs = lineSegs[code];
+  if (!grid) return null;
+  const cla = Math.round(ll[0] / CELL), cln = Math.round(ll[1] / CELL);
+  let best = null; const seen = new Set();
+  for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) {
+    const arr = grid.get((cla + i) + "|" + (cln + j));
+    if (!arr) continue;
+    for (const idx of arr) {
+      if (seen.has(idx)) continue;
+      seen.add(idx);
+      const s = segs[idx], pr = projSeg(ll, s.a, s.b);
+      if (!best || pr.dist < best.dist) best = pr;
+    }
+  }
+  return best;
+}
+function bearingScreen(from, to) {
+  const a = map.latLngToContainerPoint(from), b = map.latLngToContainerPoint(to);
+  return Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI;
+}
 
 const nowSec = () => Date.now() / 1000;
 const distM = (a, b) =>
@@ -59,6 +113,7 @@ async function cargarRed() {
     }
     routeLayers[code] = grp;
     lineasVistas.add(code); lineasVisibles.add(code);
+    indexarRuta(code, paths);
     grp.addTo(map);
   }
   dibujarParadas(net.stops || []);
@@ -175,25 +230,30 @@ function posEstim(e) {
   const el = Math.max(0, Math.min(EXTRAP_MAX_S, nowSec() - e.anchorClient));
   return [e.anchor[0] + e.vel[0] * el, e.anchor[1] + e.vel[1] * el];
 }
-function rumbPantalla(ll, vel) {
-  const a = map.latLngToContainerPoint(ll);
-  const b = map.latLngToContainerPoint([ll[0] + vel[0] * 30, ll[1] + vel[1] * 30]);
-  return Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI;
-}
 function animar() {
   for (const e of buses) {
     const vis = lineasVisibles.has(e.linea);
     const elm = e.marker.getElement();
     if (elm) elm.style.display = vis ? "" : "none";
     if (!vis) continue;
-    const ll = posEstim(e);
+    const raw = posEstim(e);
+    // enganxa el bus a la via de la seua línia (si està prou a prop); l'angle de
+    // la fletxa segueix la tangent de la via, orientada segons el sentit de marxa
+    let ll = raw, to = [raw[0] + e.vel[0] * 30, raw[1] + e.vel[1] * 30];
+    const snap = snapToLine(e.linea, raw);
+    if (snap && snap.dist < SNAP_MAX_M) {
+      ll = snap.point;
+      let tx = snap.b[0] - snap.a[0], ty = snap.b[1] - snap.a[1];
+      if (e.vel[0] * tx + e.vel[1] * ty < 0) { tx = -tx; ty = -ty; }
+      to = [ll[0] + tx, ll[1] + ty];
+    }
     e.shown = ll;
     e.marker.setLatLng(ll);
     if (!elm) continue;
     const dot = elm.querySelector(".bus-dot"), arr = elm.querySelector(".bus-arrow");
     if (!dot || !arr) continue;
     if (e.speed >= MOVE_MIN_MS) {
-      arr.style.transform = `rotate(${rumbPantalla(ll, e.vel)}deg)`;
+      arr.style.transform = `rotate(${bearingScreen(ll, to)}deg)`;
       arr.style.display = "block"; dot.style.display = "none";
     } else {
       arr.style.display = "none"; dot.style.display = "block";
