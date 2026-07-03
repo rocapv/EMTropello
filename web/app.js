@@ -1,12 +1,12 @@
 /* EMTropello · frontend (valencià) — busos d'EMT València en directe.
-   La Raspa sondeja el geoportal cada 5 min i el client demana cada 1 min; entre
-   dades reals el bus es MOU per estima (dead reckoning): el servidor dóna la
-   posició actual i l'anterior de cada bus -> calculem la velocitat i avancem el
-   marcador de forma contínua a eixa velocitat, corregint a cada dada nova. */
+   La Raspa sondeja el geoportal cada 5 min i el client demana cada 1 min. NO
+   s'extrapola: cada bus es pinta en la seua ÚLTIMA posició GPS real (enganxada a
+   la via), i "salta"/llisca cap a la nova cada vegada que arriba dada nova. Així
+   queda sobre el traçat i és exacte (extrapolar en recta el treia de la corba).
+   La velocitat (posició actual - anterior) només s'usa per orientar la fletxa. */
 const API = "";
 const REFRESH_MS = 60000;    // el client demana busos a la Raspa cada 1 min
-const ANIM_MS = 500;         // pas d'animació (estima)
-const EXTRAP_MAX_S = 330;    // no extrapolar més enllà d'això (evita que un bus vole)
+const ANIM_MS = 500;         // pas d'animació (reorientació de fletxes en zoom/pan)
 const MATCH_MAX_M = 3000;    // radi per reidentificar un bus entre pulls
 const MOVE_MIN_MS = 0.7;     // velocitat mínima (m/s) per pintar-lo "en marxa"
 const MAX_SPEED_MS = 25;     // per damunt d'això => emparellament dolent, el deixem parat
@@ -227,8 +227,7 @@ function actualizarBuses(data, edad) {
 
 /* posició estimada d'un bus ara mateix */
 function posEstim(e) {
-  const el = Math.max(0, Math.min(EXTRAP_MAX_S, nowSec() - e.anchorClient));
-  return [e.anchor[0] + e.vel[0] * el, e.anchor[1] + e.vel[1] * el];
+  return e.anchor;   // sense extrapolació: última posició GPS real (sondeig de 5 min)
 }
 function animar() {
   for (const e of buses) {
