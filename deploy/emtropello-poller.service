@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=roca
 WorkingDirectory=/home/roca/EMTropello
-ExecStart=/home/roca/EMTropello/.venv/bin/python -m backend.poller --interval 15
+ExecStart=/home/roca/EMTropello/.venv/bin/python -m backend.poller --interval 300
 Restart=always
 RestartSec=10
 

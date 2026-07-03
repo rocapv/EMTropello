@@ -1,15 +1,15 @@
-/* EMTropello · frontend (valencià) — busos d'EMT València en directe sobre el mapa.
-   Les posicions són GPS reals (capa 384 del geoportal); el marcador llisca cap a
-   la nova posició i la fletxa gira segons el desplaçament real. Punt = parat. */
+/* EMTropello · frontend (valencià) — busos d'EMT València en directe.
+   La Raspa sondeja el geoportal cada 5 min i el client demana cada 1 min; entre
+   dades reals el bus es MOU per estima (dead reckoning): el servidor dóna la
+   posició actual i l'anterior de cada bus -> calculem la velocitat i avancem el
+   marcador de forma contínua a eixa velocitat, corregint a cada dada nova. */
 const API = "";
-const REFRESH_MS = 60000;   // el client demana busos a la Raspa cada 1 min
-const MOVE_MIN_M = 20;      // desplaçament mínim (m) per registrar moviment nou
-const MATCH_MAX_M = 2600;   // radi màxim per lligar un bus al seu marcador previ
-const STILL_AFTER_MS = 360000; // sense moure's 6 min -> es considera parat (punt)
-// La Raspa sondeja el geoportal cada 5 min i el client demana cada 1 min: entre
-// dues dades reals (5 min) el bus fa un salt gran. El marcador llisca de forma
-// CONTÍNUA cap a la nova posició durant eixos 5 min (transició CSS de 300 s),
-// conservant el rumb; només passa a punt després de 6 min sense moure's.
+const REFRESH_MS = 60000;    // el client demana busos a la Raspa cada 1 min
+const ANIM_MS = 500;         // pas d'animació (estima)
+const EXTRAP_MAX_S = 330;    // no extrapolar més enllà d'això (evita que un bus vole)
+const MATCH_MAX_M = 3000;    // radi per reidentificar un bus entre pulls
+const MOVE_MIN_MS = 0.7;     // velocitat mínima (m/s) per pintar-lo "en marxa"
+const MAX_SPEED_MS = 25;     // per damunt d'això => emparellament dolent, el deixem parat
 
 /* color estable i viu per línia (hash del codi -> to HSL) */
 const colorCache = {};
@@ -17,8 +17,7 @@ function colorLinea(linea) {
   if (colorCache[linea]) return colorCache[linea];
   let h = 0;
   for (let i = 0; i < linea.length; i++) h = (h * 31 + linea.charCodeAt(i)) >>> 0;
-  const hue = h % 360;
-  const c = `hsl(${hue} 72% 58%)`;
+  const c = `hsl(${h % 360} 72% 60%)`;
   colorCache[linea] = c;
   return c;
 }
@@ -32,13 +31,36 @@ L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}{r}.p
   { maxZoom: 20, subdomains: "abcd", opacity: 0.7 }).addTo(map);
 
 const busLayer = L.layerGroup().addTo(map);
-const marcadores = [];             // {marker, linea, trayecto, realLL, fromLL, toLL, moving}
+const buses = [];                  // estat viu de cada bus
+const routeLayers = {};            // code -> L.layerGroup (trazado)
 const lineasVisibles = new Set();
-let lineasVistas = new Set();      // totes les línies observades (per a la llegenda)
-let ultimoTs = 0;
+const lineasVistas = new Set();
+let ultimoTs = 0, ultimoPts = 0, edadSeg = 0;
 
+const nowSec = () => Date.now() / 1000;
 const distM = (a, b) =>
   Math.hypot((a[0] - b[0]) * 111000, (a[1] - b[1]) * Math.cos(a[0] * Math.PI / 180) * 111000);
+
+/* ---------- trazado de línies (estàtic) ---------- */
+async function cargarRed() {
+  let net;
+  try { net = await (await fetch(API + "api/network")).json(); }
+  catch (e) { return; }
+  const routes = net.routes || {};
+  for (const [code, info] of Object.entries(routes)) {
+    const paths = info.paths || [];
+    if (!paths.length) continue;
+    const grp = L.layerGroup();
+    for (const path of paths) {
+      L.polyline(path, { color: colorLinea(code), weight: 2, opacity: 0.45,
+        smoothFactor: 1.5, interactive: false }).addTo(grp);
+    }
+    routeLayers[code] = grp;
+    lineasVistas.add(code); lineasVisibles.add(code);
+    grp.addTo(map);
+  }
+  construirLeyenda();
+}
 
 /* ---------- icona: punt (parat) o fletxa (en marxa) ---------- */
 function iconoBus(color) {
@@ -54,132 +76,146 @@ function iconoBus(color) {
     iconSize: [22, 22], iconAnchor: [11, 11],
   });
 }
-// angle en pantalla (graus) del rumb from->to, amb la projecció actual del mapa
-function rumbPantalla(fromLL, toLL) {
-  const pa = map.latLngToContainerPoint(fromLL), pb = map.latLngToContainerPoint(toLL);
-  return Math.atan2(pb.y - pa.y, pb.x - pa.x) * 180 / Math.PI;
-}
-function pintarIcona(e) {
-  const el = e.marker.getElement();
-  if (!el) return;
-  const dot = el.querySelector(".bus-dot"), arr = el.querySelector(".bus-arrow");
-  if (!dot || !arr) return;
-  if (e.moving && e.fromLL && e.toLL) {
-    arr.style.transform = `rotate(${rumbPantalla(e.fromLL, e.toLL)}deg)`;
-    arr.style.display = "block"; dot.style.display = "none";
-  } else {
-    arr.style.display = "none"; dot.style.display = "block";
-  }
-}
-
-function popupBus(linea, trayecto, fecha) {
-  const c = colorLinea(linea);
-  const edat = fecha ? `<div class="pop-edat">GPS fa ${fmtEdat(fecha)}</div>` : "";
-  return `<span class="pop-linea" style="background:${c}">${linea}</span>` +
-    `<span class="pop-tray">${trayecto || ""}</span>${edat}`;
+function popupBus(b) {
+  const c = colorLinea(b.linea);
+  const edat = b.fecha ? `<div class="pop-edat">GPS fa ${fmtEdat(b.fecha)}</div>` : "";
+  return `<span class="pop-linea" style="background:${c}">${b.linea}</span>` +
+    `<span class="pop-tray">${b.trayecto || ""}</span>${edat}`;
 }
 function fmtEdat(fechaMs) {
-  const s = Math.max(0, Math.floor(Date.now() / 1000) - Math.floor(fechaMs / 1000));
+  const s = Math.max(0, Math.floor(nowSec()) - Math.floor(fechaMs / 1000));
   if (s < 60) return `${s} s`;
   const m = Math.floor(s / 60);
   return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`;
 }
 
-/* ---------- emparellament estable bus<->marcador ---------- */
-function pintarBusos(busos) {
-  const now = Date.now();
-  for (const e of marcadores) e.usado = false;
+/* ---------- refresc: assigna àncora + velocitat a cada bus ---------- */
+function actualizarBuses(data, edad) {
+  const busos = data.busos || [];
+  const dt = (data.ts && data.pts) ? Math.max(1, data.ts - data.pts) : 0;
+  const anchorClient = nowSec() - edad;   // moment client en què el bus és a l'àncora
+
+  for (const e of buses) e.usado = false;
   const nuevos = [];
 
-  // registra línies noves ABANS de dibuixar (si no, la 1a passada no pintaria res:
-  // cada línia nova arranca visible)
+  // registra línies noves (per si un bus circula d'una línia sense trazado)
   let cambio = false;
-  for (const b of busos) {
-    if (b.linea && !lineasVistas.has(b.linea)) {
-      lineasVistas.add(b.linea); lineasVisibles.add(b.linea); cambio = true;
-    }
+  for (const b of busos) if (b.linea && !lineasVistas.has(b.linea)) {
+    lineasVistas.add(b.linea); lineasVisibles.add(b.linea); cambio = true;
   }
-  if (cambio) construirLeyenda();
 
   for (const b of busos) {
-    if (!lineasVisibles.has(b.linea)) continue;
-    const ll = [b.lat, b.lng];
-    // millor marcador lliure de la mateixa línia+trajecte, dins del radi
-    let best = null, bestD = Infinity;
-    for (const e of marcadores) {
+    const anchor = [b.lat, b.lng];
+    // velocitat (graus/s) a partir de la posició anterior
+    let vel = [0, 0], speed = 0;
+    if (b.plat != null && dt > 0) {
+      const segM = distM([b.plat, b.plng], anchor);
+      speed = segM / dt;
+      if (speed <= MAX_SPEED_MS) vel = [(b.lat - b.plat) / dt, (b.lng - b.plng) / dt];
+      else speed = 0;   // salt impossible => emparellament dolent, el deixem quiet
+    }
+    // reidentifica amb un marcador existent (mateixa línia+sentit, més pròxim)
+    let best = null, bestD = MATCH_MAX_M;
+    for (const e of buses) {
       if (e.usado || e.linea !== b.linea || e.trayecto !== b.trayecto) continue;
-      const d = distM(e.realLL, ll);
+      const d = distM(e.anchor, anchor);
       if (d < bestD) { bestD = d; best = e; }
     }
-    if (best && bestD < MATCH_MAX_M) {
+    if (best) {
       best.usado = true;
-      const disp = distM(best.realLL, ll);
-      if (disp >= MOVE_MIN_M) {           // GPS actualitzat: nou tram i rumb
-        best.fromLL = best.realLL; best.toLL = ll; best.realLL = ll; best.lastMove = now;
-      }
-      // en marxa mentre s'haja mogut fa poc; si no, passa a punt (parada/capçalera)
-      best.moving = (now - best.lastMove) < STILL_AFTER_MS && !!best.fromLL;
-      best.fecha = b.fecha; best.trayecto = b.trayecto;
-      best.marker.setLatLng(ll);
-      best.marker.setPopupContent(popupBus(b.linea, b.trayecto, b.fecha));
-      pintarIcona(best);
+      best.anchor = anchor; best.vel = vel; best.speed = speed;
+      best.anchorClient = anchorClient; best.fecha = b.fecha;
+      best.trayecto = b.trayecto;
+      best.marker.setPopupContent(popupBus(b));
     } else {
-      const marker = L.marker(ll, { icon: iconoBus(colorLinea(b.linea)) })
-        .bindPopup(popupBus(b.linea, b.trayecto, b.fecha));
+      const marker = L.marker(anchor, { icon: iconoBus(colorLinea(b.linea)) })
+        .bindPopup(popupBus(b));
       marker.addTo(busLayer);
-      nuevos.push({ marker, linea: b.linea, trayecto: b.trayecto,
-        realLL: ll, fromLL: null, toLL: null, moving: false, fecha: b.fecha,
-        lastMove: 0, usado: true });
+      nuevos.push({ marker, linea: b.linea, trayecto: b.trayecto, anchor, vel,
+        speed, anchorClient, fecha: b.fecha, shown: anchor.slice(), usado: true });
     }
   }
-  // esborra marcadors òrfens
-  for (let i = marcadores.length - 1; i >= 0; i--) {
-    if (!marcadores[i].usado) { busLayer.removeLayer(marcadores[i].marker); marcadores.splice(i, 1); }
-  }
-  for (const e of nuevos) { marcadores.push(e); pintarIcona(e); }
+  // esborra òrfens
+  for (let i = buses.length - 1; i >= 0; i--)
+    if (!buses[i].usado) { busLayer.removeLayer(buses[i].marker); buses.splice(i, 1); }
+  for (const e of nuevos) buses.push(e);
+  if (cambio) construirLeyenda();
 }
 
-/* ---------- llegenda de línies (toggle) ---------- */
+/* posició estimada d'un bus ara mateix */
+function posEstim(e) {
+  const el = Math.max(0, Math.min(EXTRAP_MAX_S, nowSec() - e.anchorClient));
+  return [e.anchor[0] + e.vel[0] * el, e.anchor[1] + e.vel[1] * el];
+}
+function rumbPantalla(ll, vel) {
+  const a = map.latLngToContainerPoint(ll);
+  const b = map.latLngToContainerPoint([ll[0] + vel[0] * 30, ll[1] + vel[1] * 30]);
+  return Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI;
+}
+function animar() {
+  for (const e of buses) {
+    const vis = lineasVisibles.has(e.linea);
+    const elm = e.marker.getElement();
+    if (elm) elm.style.display = vis ? "" : "none";
+    if (!vis) continue;
+    const ll = posEstim(e);
+    e.shown = ll;
+    e.marker.setLatLng(ll);
+    if (!elm) continue;
+    const dot = elm.querySelector(".bus-dot"), arr = elm.querySelector(".bus-arrow");
+    if (!dot || !arr) continue;
+    if (e.speed >= MOVE_MIN_MS) {
+      arr.style.transform = `rotate(${rumbPantalla(ll, e.vel)}deg)`;
+      arr.style.display = "block"; dot.style.display = "none";
+    } else {
+      arr.style.display = "none"; dot.style.display = "block";
+    }
+  }
+}
+
+/* ---------- llegenda (toggle línia: trazado + busos) ---------- */
 function construirLeyenda() {
   const ley = document.getElementById("leyenda");
   ley.innerHTML = "";
-  const lineas = [...lineasVistas].sort((a, b) =>
-    a.localeCompare(b, undefined, { numeric: true }));
+  const lineas = [...lineasVistas].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   for (const l of lineas) {
     const chip = document.createElement("span");
     chip.className = "chip" + (lineasVisibles.has(l) ? "" : " off");
     chip.textContent = l;
     chip.style.background = colorLinea(l);
     chip.onclick = () => {
-      if (lineasVisibles.has(l)) { lineasVisibles.delete(l); chip.classList.add("off"); }
-      else { lineasVisibles.add(l); chip.classList.remove("off"); }
-      pintarBusos(ultimoBusos);
+      if (lineasVisibles.has(l)) {
+        lineasVisibles.delete(l); chip.classList.add("off");
+        if (routeLayers[l]) map.removeLayer(routeLayers[l]);
+      } else {
+        lineasVisibles.add(l); chip.classList.remove("off");
+        if (routeLayers[l]) routeLayers[l].addTo(map);
+      }
+      animar();
     };
     ley.appendChild(chip);
   }
   document.getElementById("ley-count").textContent = lineas.length;
 }
 
-/* ---------- refresc ---------- */
-let ultimoBusos = [];
+/* ---------- refresc de dades ---------- */
 async function refrescar() {
   try {
     const data = await (await fetch(API + "api/buses?_=" + Date.now(), { cache: "no-store" })).json();
-    ultimoBusos = data.busos || [];
-    ultimoTs = data.ts || Math.floor(Date.now() / 1000);
-    pintarBusos(ultimoBusos);
-    const edad = data.edad_seg == null ? "—" : data.edad_seg + " s";
+    edadSeg = data.edad_seg == null ? 0 : data.edad_seg;
+    ultimoTs = data.ts || Math.floor(nowSec());
+    actualizarBuses(data, edadSeg);
+    animar();
+    const edad = data.edad_seg == null ? "—" : (data.edad_seg < 90 ? data.edad_seg + " s"
+      : Math.round(data.edad_seg / 60) + " min");
     const vis = [...lineasVisibles].length, tot = lineasVistas.size;
     const filtro = vis < tot ? `<br><span style="color:#9a9aac">${vis}/${tot} línies visibles</span>` : "";
     document.getElementById("stats").innerHTML =
-      `<b>${ultimoBusos.length}</b> busos en directe<br>dades fa <b>${edad}</b>${filtro}`;
+      `<b>${(data.busos || []).length}</b> busos en directe<br>dades fa <b>${edad}</b>${filtro}`;
   } catch (e) {
     document.getElementById("stats").textContent = "sense connexió amb el backend";
   }
 }
-
-/* en moure/fer zoom, recalcula l'angle de les fletxes */
-map.on("zoomend moveend", () => { for (const e of marcadores) pintarIcona(e); });
 
 function tickSegon() {
   document.getElementById("reloj").textContent = new Date().toLocaleTimeString("ca-ES");
@@ -195,8 +231,10 @@ function tickSegon() {
 })();
 
 (async function main() {
+  await cargarRed();
   await refrescar();
   setInterval(refrescar, REFRESH_MS);
+  setInterval(animar, ANIM_MS);
   setInterval(tickSegon, 1000);
   tickSegon();
 })();

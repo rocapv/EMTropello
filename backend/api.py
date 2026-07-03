@@ -11,6 +11,8 @@ Metroviolencia). Token en data/token.txt (gitignored) o env EMT_TOKEN.
 """
 from __future__ import annotations
 
+import json
+import math
 import os
 import sqlite3
 import time
@@ -23,9 +25,15 @@ from fastapi.staticfiles import StaticFiles
 ROOT = Path(__file__).resolve().parent.parent
 DB = ROOT / "data" / "emt.db"
 WEB = ROOT / "web"
+ROUTES_FILE = ROOT / "data" / "routes.json"
 TOKEN_FILE = ROOT / "data" / "token.txt"
 
 app = FastAPI(title="EMTropello", version="0.1")
+
+_ROUTES_CACHE: dict | None = None
+MATCH_MAX_M = 3000     # radi per lligar un bus amb la seua posició de la pasada anterior
+MIN_DT_SEC = 40        # la pasada "anterior" ha de ser >= això d'antiga (si no, el GPS
+                       # d'EMT no ha refrescat i eixiria velocitat 0 -> tot parat)
 
 
 def _token() -> str:
@@ -76,33 +84,82 @@ def _con() -> sqlite3.Connection:
     return con
 
 
-def _last_snapshot(con) -> sqlite3.Row | None:
-    return con.execute("SELECT * FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()
+def _cur_prev_snapshots(con):
+    """Última pasada + una pasada anterior de >= MIN_DT_SEC (para que haya
+    desplazamiento real; si no hay suficiente historial, la más antigua)."""
+    snaps = con.execute("SELECT * FROM snapshots ORDER BY id DESC LIMIT 40").fetchall()
+    if not snaps:
+        return None, None
+    cur = snaps[0]
+    prev = None
+    for s in snaps[1:]:
+        if cur["ts"] - s["ts"] >= MIN_DT_SEC:
+            prev = s
+            break
+    if prev is None and len(snaps) > 1:
+        prev = snaps[-1]
+    return cur, prev
+
+
+def _mdist(a_lat, a_lng, b_lat, b_lng) -> float:
+    return math.hypot((a_lat - b_lat) * 111000,
+                      (a_lng - b_lng) * math.cos(a_lat * math.pi / 180) * 111000)
 
 
 @app.get("/api/buses")
 def buses():
     con = _con()
-    snap = _last_snapshot(con)
-    if not snap:
-        return {"ts": None, "n": 0, "busos": []}
-    rows = con.execute(
-        "SELECT gid,linea,trayecto,lat,lng,fecha FROM buses WHERE snapshot_id=?",
-        (snap["id"],),
-    ).fetchall()
-    busos = [
-        {"gid": r["gid"], "linea": r["linea"], "trayecto": r["trayecto"],
-         "lat": r["lat"], "lng": r["lng"], "fecha": r["fecha"]}
-        for r in rows
-    ]
-    return {"ts": snap["ts"], "edad_seg": int(time.time()) - snap["ts"],
-            "n": len(busos), "busos": busos}
+    cur, prev = _cur_prev_snapshots(con)
+    if not cur:
+        return {"ts": None, "pts": None, "n": 0, "busos": []}
+
+    # posiciones de la pasada anterior, agrupadas por (línea, trayecto)
+    prev_by_key: dict = {}
+    if prev:
+        for r in con.execute(
+            "SELECT linea,trayecto,lat,lng FROM buses WHERE snapshot_id=?", (prev["id"],)
+        ):
+            prev_by_key.setdefault((r["linea"], r["trayecto"]), []).append((r["lat"], r["lng"]))
+
+    busos = []
+    used: dict = {}   # evita asignar el mismo punto previo a dos buses
+    for r in con.execute(
+        "SELECT gid,linea,trayecto,lat,lng,fecha FROM buses WHERE snapshot_id=?", (cur["id"],)
+    ):
+        plat = plng = None
+        cands = prev_by_key.get((r["linea"], r["trayecto"]))
+        if cands:
+            best_i, best_d = -1, MATCH_MAX_M
+            seen = used.setdefault((r["linea"], r["trayecto"]), set())
+            for i, (la, ln) in enumerate(cands):
+                if i in seen:
+                    continue
+                d = _mdist(r["lat"], r["lng"], la, ln)
+                if d < best_d:
+                    best_d, best_i = d, i
+            if best_i >= 0:
+                seen.add(best_i)
+                plat, plng = cands[best_i]
+        busos.append({"linea": r["linea"], "trayecto": r["trayecto"],
+                      "lat": r["lat"], "lng": r["lng"], "fecha": r["fecha"],
+                      "plat": plat, "plng": plng})
+
+    return {"ts": cur["ts"], "pts": prev["ts"] if prev else None,
+            "edad_seg": int(time.time()) - cur["ts"], "n": len(busos), "busos": busos}
+
+
+@app.get("/api/network")
+def network():
+    global _ROUTES_CACHE
+    if _ROUTES_CACHE is None:
+        _ROUTES_CACHE = json.loads(ROUTES_FILE.read_text(encoding="utf-8")) if ROUTES_FILE.exists() else {}
+    return {"routes": _ROUTES_CACHE}
 
 
 @app.get("/api/health")
 def health():
     con = _con()
-    snap = _last_snapshot(con)
+    snap = con.execute("SELECT * FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()
     n = con.execute("SELECT COUNT(*) c FROM snapshots").fetchone()["c"]
     return {"ok": True, "snapshots": n, "ultimo_ts": snap["ts"] if snap else None}
 

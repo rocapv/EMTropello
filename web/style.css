@@ -118,9 +118,8 @@ html, body {
   position: absolute; left: 0; top: 0; display: none;
   filter: drop-shadow(0 0 3px rgba(0, 0, 0, 0.85));
 }
-/* moviment continu entre dades (la Raspa dóna dades cada 5 min): el marcador
-   llisca cap a la nova posició al llarg de tot l'interval. Rotació instantània. */
-.leaflet-marker-icon { transition: transform 300s linear; }
+/* suavitza els passos d'estima (cada 0,5 s) i la correcció en arribar dada nova */
+.leaflet-marker-icon { transition: transform 0.9s linear; }
 
 .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: #16161f; color: var(--txt); }
 .leaflet-popup-content { font-size: 13px; }
