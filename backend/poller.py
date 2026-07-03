@@ -56,6 +56,23 @@ def init_db() -> sqlite3.Connection:
 def poll_once(con: sqlite3.Connection, session: requests.Session) -> int:
     buses = fetch_buses(session)
     ts = int(time.time())
+
+    # Guarda anti-pasada-anómala: a veces el geoportal devuelve datos parciales
+    # (p. ej. 50 en vez de ~280). Como el frontend muestra la última pasada, una
+    # lectura parcial degradaría la web hasta la siguiente. Si llegan muchos menos
+    # busos que en la pasada anterior (o ninguno), la descartamos y conservamos la
+    # última buena.
+    prev = con.execute("SELECT id FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()
+    prev_n = 0
+    if prev:
+        prev_n = con.execute(
+            "SELECT COUNT(*) FROM buses WHERE snapshot_id=?", (prev[0],)
+        ).fetchone()[0]
+    if not buses or (prev_n > 80 and len(buses) < 0.5 * prev_n):
+        print(f"[{time.strftime('%H:%M:%S')}] pasada anómala descartada: "
+              f"{len(buses)} busos (anterior {prev_n})")
+        return prev[0] if prev else -1
+
     cur = con.execute("INSERT INTO snapshots(ts) VALUES (?)", (ts,))
     snap_id = cur.lastrowid
     con.executemany(
