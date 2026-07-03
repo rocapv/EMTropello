@@ -64,7 +64,7 @@ async def auth_token(request: Request, call_next):
         resp = await call_next(request)
         if q == token:
             resp.set_cookie("emttoken", token, max_age=31536000,
-                            path="/emtropello", httponly=True, samesite="lax")
+                            path="/EMT", httponly=True, samesite="lax")
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     resp.headers["Pragma"] = "no-cache"
     return resp

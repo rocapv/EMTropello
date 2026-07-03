@@ -24,8 +24,8 @@ from .arcgis import fetch_buses
 ROOT = Path(__file__).resolve().parent.parent
 DB = ROOT / "data" / "emt.db"
 
-INTERVAL = 15          # segundos entre pasadas (el GPS de EMT refresca ~cada 20-30 s)
-KEEP_SNAPSHOTS = 40    # poda: conserva las últimas N pasadas (para calcular rumbo)
+INTERVAL = 300         # segundos entre pasadas (la Raspa mira el geoportal cada 5 min)
+KEEP_SNAPSHOTS = 20    # poda: conserva las últimas N pasadas (para calcular rumbo)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS snapshots (

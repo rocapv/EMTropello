@@ -2,14 +2,14 @@
    Les posicions són GPS reals (capa 384 del geoportal); el marcador llisca cap a
    la nova posició i la fletxa gira segons el desplaçament real. Punt = parat. */
 const API = "";
-const REFRESH_MS = 12000;   // el client demana busos a la Raspa cada 12 s
-const GLIDE_MS = 12000;     // durada del lliscament entre pulls (= transició CSS)
-const MOVE_MIN_M = 12;      // desplaçament mínim (m) per registrar moviment nou
-const MATCH_MAX_M = 700;    // radi màxim per lligar un bus al seu marcador previ
-const STILL_AFTER_MS = 50000; // sense moure's tant de temps -> es considera parat (punt)
-// El GPS d'EMT refresca cada ~20-30 s, més que el nostre refresc: entre dues
-// actualitzacions reals el bus manté la seua última posició. Per no pampalluguejar
-// a "parat", conservem el rumb i només passem a punt després de STILL_AFTER_MS.
+const REFRESH_MS = 60000;   // el client demana busos a la Raspa cada 1 min
+const MOVE_MIN_M = 20;      // desplaçament mínim (m) per registrar moviment nou
+const MATCH_MAX_M = 2600;   // radi màxim per lligar un bus al seu marcador previ
+const STILL_AFTER_MS = 360000; // sense moure's 6 min -> es considera parat (punt)
+// La Raspa sondeja el geoportal cada 5 min i el client demana cada 1 min: entre
+// dues dades reals (5 min) el bus fa un salt gran. El marcador llisca de forma
+// CONTÍNUA cap a la nova posició durant eixos 5 min (transició CSS de 300 s),
+// conservant el rumb; només passa a punt després de 6 min sense moure's.
 
 /* color estable i viu per línia (hash del codi -> to HSL) */
 const colorCache = {};
@@ -90,10 +90,18 @@ function pintarBusos(busos) {
   const now = Date.now();
   for (const e of marcadores) e.usado = false;
   const nuevos = [];
-  const activas = new Set();
+
+  // registra línies noves ABANS de dibuixar (si no, la 1a passada no pintaria res:
+  // cada línia nova arranca visible)
+  let cambio = false;
+  for (const b of busos) {
+    if (b.linea && !lineasVistas.has(b.linea)) {
+      lineasVistas.add(b.linea); lineasVisibles.add(b.linea); cambio = true;
+    }
+  }
+  if (cambio) construirLeyenda();
 
   for (const b of busos) {
-    if (b.linea) activas.add(b.linea);
     if (!lineasVisibles.has(b.linea)) continue;
     const ll = [b.lat, b.lng];
     // millor marcador lliure de la mateixa línia+trajecte, dins del radi
@@ -129,11 +137,6 @@ function pintarBusos(busos) {
     if (!marcadores[i].usado) { busLayer.removeLayer(marcadores[i].marker); marcadores.splice(i, 1); }
   }
   for (const e of nuevos) { marcadores.push(e); pintarIcona(e); }
-
-  // llegenda: afig línies noves observades
-  let cambio = false;
-  for (const l of activas) if (!lineasVistas.has(l)) { lineasVistas.add(l); lineasVisibles.add(l); cambio = true; }
-  if (cambio) construirLeyenda();
 }
 
 /* ---------- llegenda de línies (toggle) ---------- */

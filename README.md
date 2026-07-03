@@ -51,8 +51,9 @@ python -m uvicorn backend.api:app --port 8791
 
 ## Desplegament (Raspa)
 
-Dos serveis systemd (`deploy/emtropello-poller.service` + `emtropello-web.service`)
-i un `conf` d'Apache (`deploy/apache-emtropello.conf`) que fa de proxy invers a
-`127.0.0.1:8791` **només per a la LAN** → `http://<ip-lan>/emtropello/`.
+Dos serveis systemd (`deploy/emtropello-poller.service`, sondeig cada **5 min** +
+`emtropello-web.service`) i un `conf` d'Apache (`deploy/apache-emtropello.conf`) que
+fa de proxy invers a `127.0.0.1:8791` **només per a la LAN** → `http://192.168.1.100/EMT/`.
+El client (navegador) demana dades a la Raspa cada **1 min**.
 
 UI en valencià. Dades © Ajuntament de València (geoportal obert). Projecte no oficial.
