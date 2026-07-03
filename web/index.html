@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ca-ES-valencia">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <title>EMTropello · busos en directe · EMT València</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="map"></div>
+
+  <header id="hud">
+    <button id="hud-toggle" title="Amaga/mostra el panell" aria-label="Amaga el panell">«</button>
+    <div id="hud-body">
+      <div class="titulo">
+        <span class="dot-live"></span> EMT<span class="viol">ROPELLO</span>
+      </div>
+      <div id="stats">carregant…</div>
+      <div class="ley-tit">Línies <span id="ley-count"></span></div>
+      <div id="leyenda"></div>
+    </div>
+  </header>
+
+  <div id="reloj"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
