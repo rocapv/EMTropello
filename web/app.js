@@ -53,12 +53,19 @@ function indexarRuta(code, rawPaths) {
     for (let i = 1; i < raw.length; i++) cum.push(cum[i - 1] + distM(raw[i - 1], raw[i]));
     const pi = paths.length;
     paths.push({ pts: raw, cum, len: cum[cum.length - 1] });
-    for (let si = 0; si + 1 < raw.length; si++)
-      for (const p of [raw[si], raw[si + 1]]) {
-        const k = cellK(p);
-        let a = grid.get(k); if (!a) grid.set(k, a = []);
-        a.push(pi * 100000 + si);
+    for (let si = 0; si + 1 < raw.length; si++) {
+      const a = raw[si], b = raw[si + 1], key = pi * 100000 + si;
+      const steps = Math.max(1, Math.ceil(distM(a, b) / 40));  // mostreja cel·les cada ~40 m
+      let lastK = null;
+      for (let s = 0; s <= steps; s++) {
+        const f = s / steps;
+        const k = cellK([a[0] + f * (b[0] - a[0]), a[1] + f * (b[1] - a[1])]);
+        if (k === lastK) continue;
+        lastK = k;
+        let arr = grid.get(k); if (!arr) grid.set(k, arr = []);
+        arr.push(key);
       }
+    }
     for (const end of [0, 1]) {
       const k = nodeK(end ? raw[raw.length - 1] : raw[0]);
       let a = nodes.get(k); if (!a) nodes.set(k, a = []);
