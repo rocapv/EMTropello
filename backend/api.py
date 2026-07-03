@@ -26,11 +26,12 @@ ROOT = Path(__file__).resolve().parent.parent
 DB = ROOT / "data" / "emt.db"
 WEB = ROOT / "web"
 ROUTES_FILE = ROOT / "data" / "routes.json"
+STOPS_FILE = ROOT / "data" / "stops.json"
 TOKEN_FILE = ROOT / "data" / "token.txt"
 
 app = FastAPI(title="EMTropello", version="0.1")
 
-_ROUTES_CACHE: dict | None = None
+_NET_CACHE: dict | None = None
 MATCH_MAX_M = 3000     # radi per lligar un bus amb la seua posició de la pasada anterior
 MIN_DT_SEC = 40        # la pasada "anterior" ha de ser >= això d'antiga (si no, el GPS
                        # d'EMT no ha refrescat i eixiria velocitat 0 -> tot parat)
@@ -150,10 +151,12 @@ def buses():
 
 @app.get("/api/network")
 def network():
-    global _ROUTES_CACHE
-    if _ROUTES_CACHE is None:
-        _ROUTES_CACHE = json.loads(ROUTES_FILE.read_text(encoding="utf-8")) if ROUTES_FILE.exists() else {}
-    return {"routes": _ROUTES_CACHE}
+    global _NET_CACHE
+    if _NET_CACHE is None:
+        routes = json.loads(ROUTES_FILE.read_text(encoding="utf-8")) if ROUTES_FILE.exists() else {}
+        stops = json.loads(STOPS_FILE.read_text(encoding="utf-8")) if STOPS_FILE.exists() else []
+        _NET_CACHE = {"routes": routes, "stops": stops}
+    return _NET_CACHE
 
 
 @app.get("/api/health")

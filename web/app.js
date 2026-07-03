@@ -35,6 +35,8 @@ const buses = [];                  // estat viu de cada bus
 const routeLayers = {};            // code -> L.layerGroup (trazado)
 const lineasVisibles = new Set();
 const lineasVistas = new Set();
+const stopsLayer = L.layerGroup();  // parades (visibles en acostar el zoom)
+const STOP_ZOOM = 14;               // a partir d'ací es mostren les parades
 let ultimoTs = 0, ultimoPts = 0, edadSeg = 0;
 
 const nowSec = () => Date.now() / 1000;
@@ -59,7 +61,33 @@ async function cargarRed() {
     lineasVistas.add(code); lineasVisibles.add(code);
     grp.addTo(map);
   }
+  dibujarParadas(net.stops || []);
   construirLeyenda();
+}
+
+/* ---------- parades ---------- */
+function dibujarParadas(stops) {
+  for (const s of stops) {
+    const m = L.circleMarker([s.lat, s.lng], {
+      radius: 3, color: "#0d0d12", weight: 1,
+      fillColor: "#e8e8ef", fillOpacity: 0.9,
+    });
+    m.bindPopup(() => {
+      const chips = (s.lineas || [])
+        .map((l) => `<span class="pop-linea" style="background:${colorLinea(l)}">${l}</span>`).join("");
+      return `<div class="pop-parada">🚏 ${s.nom || "Parada"}</div><div class="pop-parada-lin">${chips}</div>`;
+    });
+    m.addTo(stopsLayer);
+  }
+  actualizarParadas();
+}
+function actualizarParadas() {
+  const wanted = document.getElementById("paradas-chk").checked && map.getZoom() >= STOP_ZOOM;
+  if (wanted && !map.hasLayer(stopsLayer)) stopsLayer.addTo(map);
+  else if (!wanted && map.hasLayer(stopsLayer)) map.removeLayer(stopsLayer);
+  const hint = document.getElementById("paradas-hint");
+  if (hint) hint.style.display =
+    (document.getElementById("paradas-chk").checked && map.getZoom() < STOP_ZOOM) ? "block" : "none";
 }
 
 /* ---------- icona: punt (parat) o fletxa (en marxa) ---------- */
@@ -220,6 +248,10 @@ async function refrescar() {
 function tickSegon() {
   document.getElementById("reloj").textContent = new Date().toLocaleTimeString("ca-ES");
 }
+
+// parades: mostra/amaga segons zoom i checkbox
+map.on("zoomend", actualizarParadas);
+document.getElementById("paradas-chk").addEventListener("change", actualizarParadas);
 
 // panell colapsable
 (function () {
