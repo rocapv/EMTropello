@@ -1,0 +1,173 @@
+package com.mdk.emtropello;
+
+import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.Context;
+import android.content.DialogInterface;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.ShortcutInfo;
+import android.content.pm.ShortcutManager;
+import android.graphics.drawable.Icon;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.text.InputType;
+import android.view.KeyEvent;
+import android.webkit.WebView;
+import android.webkit.WebSettings;
+import android.webkit.WebResourceError;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
+import android.webkit.WebViewClient;
+import android.webkit.ValueCallback;
+import android.widget.EditText;
+
+// APK-quiosc del mapa de Metroviolencia. Dues variants amb el mateix codi:
+//  - personal: __TOKEN__ ve amb el token embegut -> arranca directe.
+//  - distribució: __TOKEN__ va buit -> demana el token la 1a vegada i el guarda;
+//    sense token no mostra res.
+// Prova les adreces en ordre: LAN -> HTTPS (port dedicat) -> HTTP (5580).
+// El cert autofirmat de home.pr1.es va empaquetat (network_security_config).
+public class MainActivity extends Activity {
+
+    private static final String TOKEN_EMBEGUT = "__TOKEN__";
+    private static final String BASE_LAN = "__BASE_LAN__";
+    private static final String BASE_HTTPS = "__BASE_HTTPS__";
+    private static final String BASE_HTTP = "__BASE_HTTP__";
+    private static final int TIMEOUT_MS = 4500;
+
+    private WebView web;
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private String[] urls;
+    private int idx = -1;
+    private boolean ok = false;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        web = new WebView(this);
+        WebSettings s = web.getSettings();
+        s.setJavaScriptEnabled(true);
+        s.setDomStorageEnabled(true);
+        s.setDatabaseEnabled(true);
+        s.setCacheMode(WebSettings.LOAD_NO_CACHE);
+        web.setWebViewClient(new Client());
+        setContentView(web);
+        demanarIconaEscriptori();
+
+        String token = TOKEN_EMBEGUT;
+        if (token.isEmpty()) token = prefs().getString("token", "");
+        if (token.isEmpty()) demanaToken(null);
+        else arranca(token);
+    }
+
+    private SharedPreferences prefs() {
+        return getSharedPreferences("emt", Context.MODE_PRIVATE);
+    }
+
+    // demana el token (distribució). Sense token no es mostra el mapa.
+    private void demanaToken(String avis) {
+        final EditText et = new EditText(this);
+        et.setHint("Token d'accés");
+        et.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        AlertDialog d = new AlertDialog.Builder(this)
+                .setTitle("EMTropello")
+                .setMessage(avis != null ? avis : "Introdueix el token d'accés")
+                .setView(et)
+                .setCancelable(false)
+                .setPositiveButton("Entra", null)
+                .create();
+        d.setOnShowListener(new DialogInterface.OnShowListener() {
+            @Override public void onShow(DialogInterface di) {
+                ((AlertDialog) di).getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(
+                    new android.view.View.OnClickListener() {
+                        @Override public void onClick(android.view.View v) {
+                            String t = et.getText().toString().trim();
+                            if (t.isEmpty()) return;      // sense token no continua
+                            prefs().edit().putString("token", t).apply();
+                            di.dismiss();
+                            arranca(t);
+                        }
+                    });
+            }
+        });
+        d.show();
+    }
+
+    private void arranca(String token) {
+        String q = "?token=" + token;
+        urls = new String[] { BASE_LAN + q, BASE_HTTPS + q, BASE_HTTP + q };
+        ok = false;
+        carrega(0);
+    }
+
+    private void carrega(int i) {
+        if (ok || urls == null || i >= urls.length) return;
+        idx = i;
+        web.loadUrl(urls[i]);
+        final int meu = i;
+        handler.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (!ok && idx == meu) carrega(meu + 1);   // penjat -> següent
+            }
+        }, TIMEOUT_MS);
+    }
+
+    private final class Client extends WebViewClient {
+        @Override
+        public void onPageFinished(WebView v, String url) {
+            v.evaluateJavascript("(!!document.getElementById('map'))+''",
+                new ValueCallback<String>() {
+                    @Override public void onReceiveValue(String value) {
+                        if ("true".equals(value)) ok = true;
+                        else carrega(idx + 1);
+                    }
+                });
+        }
+
+        @Override
+        public void onReceivedError(WebView v, WebResourceRequest req, WebResourceError err) {
+            if (req.isForMainFrame() && !ok) carrega(idx + 1);
+        }
+
+        @Override
+        public void onReceivedHttpError(WebView v, WebResourceRequest req, WebResourceResponse resp) {
+            // token invàlid des de fora -> 403. Esborra'l i torna a demanar-lo.
+            if (req.isForMainFrame() && resp != null && resp.getStatusCode() == 403
+                    && TOKEN_EMBEGUT.isEmpty()) {
+                ok = true;   // atura la cadena de fallback
+                prefs().edit().remove("token").apply();
+                demanaToken("Token incorrecte. Torna a introduir-lo.");
+            }
+        }
+    }
+
+    private void demanarIconaEscriptori() {
+        if (Build.VERSION.SDK_INT < 26) return;
+        SharedPreferences pref = prefs();
+        if (pref.getBoolean("icona_demanada", false)) return;
+        ShortcutManager sm = getSystemService(ShortcutManager.class);
+        if (sm == null || !sm.isRequestPinShortcutSupported()) return;
+        Intent obrir = new Intent(this, MainActivity.class);
+        obrir.setAction(Intent.ACTION_MAIN);
+        ShortcutInfo info = new ShortcutInfo.Builder(this, "emtropello")
+                .setShortLabel("EMTropello")
+                .setIcon(Icon.createWithResource(this, R.mipmap.ic_launcher))
+                .setIntent(obrir)
+                .build();
+        if (sm.requestPinShortcut(info, null)) {
+            pref.edit().putBoolean("icona_demanada", true).apply();
+        }
+    }
+
+    @Override
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        if (keyCode == KeyEvent.KEYCODE_BACK && web.canGoBack()) {
+            web.goBack();
+            return true;
+        }
+        return super.onKeyDown(keyCode, event);
+    }
+}
