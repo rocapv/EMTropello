@@ -37,30 +37,37 @@ const lineasVisibles = new Set();
 const lineasVistas = new Set();
 const stopsLayer = L.layerGroup();  // parades (visibles en acostar el zoom)
 const STOP_ZOOM = 14;               // a partir d'ací es mostren les parades
-// índex espacial de la ruta de cada línia, per "enganxar" el bus a la via
-const lineSegs = {};                // code -> [{a:[lat,lng], b:[lat,lng]}]
-const lineGrid = {};                // code -> Map(cel·la -> [idx de segment])
-const CELL = 0.0006;                // ~55 m en latitud
-const SNAP_MAX_M = 55;              // si el bus està més lluny de la via, no s'enganxa
+// graf de la ruta de cada línia: polilínies amb longitud acumulada + nodes de
+// connexió entre trams. Serveix per SIMULAR el bus avançant AL LLARG de la via.
+const RG = {};                      // code -> {paths:[{pts,cum,len}], grid:Map, nodes:Map}
+const CELL = 0.0006;                // ~55 m (cel·la per a l'enganxe)
+const cellK = (p) => Math.round(p[0] / CELL) + "|" + Math.round(p[1] / CELL);
+const nodeK = (p) => p[0].toFixed(5) + "," + p[1].toFixed(5);   // ~1 m (extrems de tram)
 let ultimoTs = 0, ultimoPts = 0, edadSeg = 0;
 
-function indexarRuta(code, paths) {
-  const segs = [], grid = new Map();
-  for (const path of paths) {
-    for (let i = 0; i + 1 < path.length; i++) {
-      const idx = segs.length;
-      segs.push({ a: path[i], b: path[i + 1] });
-      for (const p of [path[i], path[i + 1]]) {
-        const k = Math.round(p[0] / CELL) + "|" + Math.round(p[1] / CELL);
-        let arr = grid.get(k);
-        if (!arr) grid.set(k, arr = []);
-        if (arr[arr.length - 1] !== idx) arr.push(idx);
+function indexarRuta(code, rawPaths) {
+  const paths = [], grid = new Map(), nodes = new Map();
+  for (const raw of rawPaths) {
+    if (!raw || raw.length < 2) continue;
+    const cum = [0];
+    for (let i = 1; i < raw.length; i++) cum.push(cum[i - 1] + distM(raw[i - 1], raw[i]));
+    const pi = paths.length;
+    paths.push({ pts: raw, cum, len: cum[cum.length - 1] });
+    for (let si = 0; si + 1 < raw.length; si++)
+      for (const p of [raw[si], raw[si + 1]]) {
+        const k = cellK(p);
+        let a = grid.get(k); if (!a) grid.set(k, a = []);
+        a.push(pi * 100000 + si);
       }
+    for (const end of [0, 1]) {
+      const k = nodeK(end ? raw[raw.length - 1] : raw[0]);
+      let a = nodes.get(k); if (!a) nodes.set(k, a = []);
+      a.push({ pi, end });
     }
   }
-  lineSegs[code] = segs; lineGrid[code] = grid;
+  RG[code] = { paths, grid, nodes };
 }
-// projecta p sobre el segment a-b (pla local escalant lng per cos(lat))
+// projecta p sobre a-b -> {point, dist(m), t}
 function projSeg(p, a, b) {
   const cf = Math.cos(p[0] * Math.PI / 180);
   const ax = a[1] * cf, ay = a[0], bx = b[1] * cf, by = b[0], px = p[1] * cf, py = p[0];
@@ -68,25 +75,72 @@ function projSeg(p, a, b) {
   let t = L2 ? ((px - ax) * dx + (py - ay) * dy) / L2 : 0;
   t = Math.max(0, Math.min(1, t));
   const qx = ax + t * dx, qy = ay + t * dy;
-  return { point: [qy, qx / cf], dist: Math.hypot(px - qx, py - qy) * 111000, a, b };
+  return { point: [qy, qx / cf], dist: Math.hypot(px - qx, py - qy) * 111000, t };
 }
-// millor punt de la via de la línia més pròxim a ll (o null)
+// enganxa ll a la via -> {pi, arc(m des de l'inici de la path), dist, tang}
 function snapToLine(code, ll) {
-  const grid = lineGrid[code], segs = lineSegs[code];
-  if (!grid) return null;
+  const idx = RG[code]; if (!idx) return null;
   const cla = Math.round(ll[0] / CELL), cln = Math.round(ll[1] / CELL);
   let best = null; const seen = new Set();
   for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) {
-    const arr = grid.get((cla + i) + "|" + (cln + j));
+    const arr = idx.grid.get((cla + i) + "|" + (cln + j));
     if (!arr) continue;
-    for (const idx of arr) {
-      if (seen.has(idx)) continue;
-      seen.add(idx);
-      const s = segs[idx], pr = projSeg(ll, s.a, s.b);
-      if (!best || pr.dist < best.dist) best = pr;
+    for (const key of arr) {
+      if (seen.has(key)) continue; seen.add(key);
+      const pi = Math.floor(key / 100000), si = key % 100000;
+      const P = idx.paths[pi], a = P.pts[si], b = P.pts[si + 1];
+      const pr = projSeg(ll, a, b);
+      if (!best || pr.dist < best.dist)
+        best = { pi, arc: P.cum[si] + pr.t * (P.cum[si + 1] - P.cum[si]),
+                 dist: pr.dist, tang: [b[0] - a[0], b[1] - a[1]] };
     }
   }
   return best;
+}
+// punt i tangent a `arc` metres d'una path
+function pointAt(P, arc) {
+  const cum = P.cum, pts = P.pts;
+  arc = Math.max(0, Math.min(P.len, arc));
+  let lo = 0, hi = cum.length - 1;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (cum[m] < arc) lo = m + 1; else hi = m; }
+  const i = Math.max(1, lo), seg = cum[i] - cum[i - 1];
+  const t = seg ? (arc - cum[i - 1]) / seg : 0, a = pts[i - 1], b = pts[i];
+  return { pt: [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])],
+           tang: [b[0] - a[0], b[1] - a[1]] };
+}
+// en arribar a un extrem, tria la path que millor continua el rumb (menys gir)
+function siguientePath(idx, pi, dir) {
+  const P = idx.paths[pi];
+  const far = dir > 0 ? P.pts[P.pts.length - 1] : P.pts[0];
+  const near = dir > 0 ? P.pts[P.pts.length - 2] : P.pts[1];
+  const hx = far[0] - near[0], hy = far[1] - near[1], hn = Math.hypot(hx, hy) || 1;
+  const cands = idx.nodes.get(nodeK(far)); if (!cands) return null;
+  let best = null, bd = -2;
+  for (const c of cands) {
+    if (c.pi === pi) continue;
+    const Q = idx.paths[c.pi];
+    const s0 = c.end ? Q.pts[Q.pts.length - 1] : Q.pts[0];
+    const s1 = c.end ? Q.pts[Q.pts.length - 2] : Q.pts[1];
+    const ox = s1[0] - s0[0], oy = s1[1] - s0[1], on = Math.hypot(ox, oy) || 1;
+    const dot = (hx * ox + hy * oy) / (hn * on);
+    if (dot > bd) { bd = dot; best = { pi: c.pi, dir: c.end ? -1 : 1 }; }
+  }
+  return bd > -0.4 ? best : null;   // gir massa brusc: para (el reajust de 5 min ho corregix)
+}
+// avança la simulació del bus `metros` al llarg de la via
+function avanzarSim(e, metros) {
+  const idx = RG[e.linea]; if (!idx || !e.sim) return;
+  let { pi, arc, dir } = e.sim, remain = metros, guard = 0;
+  while (remain > 0.01 && guard++ < 30) {
+    const P = idx.paths[pi];
+    const toEnd = dir > 0 ? P.len - arc : arc;
+    if (remain <= toEnd) { arc += dir * remain; break; }
+    remain -= toEnd;
+    const nxt = siguientePath(idx, pi, dir);
+    if (!nxt) { arc = dir > 0 ? P.len : 0; break; }
+    pi = nxt.pi; dir = nxt.dir; arc = dir > 0 ? 0 : idx.paths[pi].len;
+  }
+  e.sim.pi = pi; e.sim.arc = arc; e.sim.dir = dir;
 }
 function bearingScreen(from, to) {
   const a = map.latLngToContainerPoint(from), b = map.latLngToContainerPoint(to);
@@ -176,7 +230,6 @@ function fmtEdat(fechaMs) {
 function actualizarBuses(data, edad) {
   const busos = data.busos || [];
   const dt = (data.ts && data.pts) ? Math.max(1, data.ts - data.pts) : 0;
-  const anchorClient = nowSec() - edad;   // moment client en què el bus és a l'àncora
 
   for (const e of buses) e.usado = false;
   const nuevos = [];
@@ -189,14 +242,31 @@ function actualizarBuses(data, edad) {
 
   for (const b of busos) {
     const anchor = [b.lat, b.lng];
-    // velocitat (graus/s) a partir de la posició anterior
-    let vel = [0, 0], speed = 0;
-    if (b.plat != null && dt > 0) {
-      const segM = distM([b.plat, b.plng], anchor);
-      speed = segM / dt;
-      if (speed <= MAX_SPEED_MS) vel = [(b.lat - b.plat) / dt, (b.lng - b.plng) / dt];
-      else speed = 0;   // salt impossible => emparellament dolent, el deixem quiet
+    // vel en recta (graus/s) només per desempatar el sentit sobre la via
+    let vel = [0, 0];
+    if (b.plat != null && dt > 0) vel = [(b.lat - b.plat) / dt, (b.lng - b.plng) / dt];
+
+    // REAJUSTA la simulació: enganxa la posició actual (i l'anterior) a la via i
+    // calcula velocitat i sentit AL LLARG de la ruta (no en recta)
+    const snC = snapToLine(b.linea, anchor);
+    const snP = b.plat != null ? snapToLine(b.linea, [b.plat, b.plng]) : null;
+    let sim = null, speed = 0;
+    if (snC) {
+      let dir = 1;
+      if (snP && snP.pi === snC.pi && dt > 0) {
+        speed = Math.abs(snC.arc - snP.arc) / dt;         // exacte al llarg de la via
+        dir = snC.arc >= snP.arc ? 1 : -1;
+      } else if (b.plat != null && dt > 0) {
+        speed = 1.2 * distM([b.plat, b.plng], anchor) / dt; // recta + factor de curvatura
+        if (vel[0] * snC.tang[0] + vel[1] * snC.tang[1] < 0) dir = -1;
+      }
+      if (speed > MAX_SPEED_MS) speed = 0;                  // emparellament dolent
+      sim = { pi: snC.pi, arc: snC.arc, dir };
+    } else if (b.plat != null && dt > 0) {
+      speed = distM([b.plat, b.plng], anchor) / dt;         // línia sense ruta (nocturnes)
+      if (speed > MAX_SPEED_MS) speed = 0;
     }
+
     // reidentifica amb un marcador existent (mateixa línia+sentit, més pròxim)
     let best = null, bestD = MATCH_MAX_M;
     for (const e of buses) {
@@ -206,16 +276,15 @@ function actualizarBuses(data, edad) {
     }
     if (best) {
       best.usado = true;
-      best.anchor = anchor; best.vel = vel; best.speed = speed;
-      best.anchorClient = anchorClient; best.fecha = b.fecha;
-      best.trayecto = b.trayecto;
+      best.anchor = anchor; best.vel = vel; best.speed = speed; best.sim = sim;
+      best.fecha = b.fecha; best.trayecto = b.trayecto;
       best.marker.setPopupContent(popupBus(b));
     } else {
-      const marker = L.marker(anchor, { icon: iconoBus(colorLinea(b.linea)) })
-        .bindPopup(popupBus(b));
+      const marker = L.marker(sim ? pointAt(RG[b.linea].paths[sim.pi], sim.arc).pt : anchor,
+        { icon: iconoBus(colorLinea(b.linea)) }).bindPopup(popupBus(b));
       marker.addTo(busLayer);
       nuevos.push({ marker, linea: b.linea, trayecto: b.trayecto, anchor, vel,
-        speed, anchorClient, fecha: b.fecha, shown: anchor.slice(), usado: true });
+        speed, sim, fecha: b.fecha, usado: true });
     }
   }
   // esborra òrfens
@@ -225,34 +294,34 @@ function actualizarBuses(data, edad) {
   if (cambio) construirLeyenda();
 }
 
-/* posició estimada d'un bus ara mateix */
-function posEstim(e) {
-  return e.anchor;   // sense extrapolació: última posició GPS real (sondeig de 5 min)
-}
+/* ---------- animació: simula el bus avançant AL LLARG de la via ---------- */
+let lastAnim = 0;
 function animar() {
+  const now = nowSec();
+  const dtF = lastAnim ? Math.min(2, now - lastAnim) : 0;   // segons des de l'últim pas
+  lastAnim = now;
   for (const e of buses) {
     const vis = lineasVisibles.has(e.linea);
     const elm = e.marker.getElement();
     if (elm) elm.style.display = vis ? "" : "none";
     if (!vis) continue;
-    const raw = posEstim(e);
-    // enganxa el bus a la via de la seua línia (si està prou a prop); l'angle de
-    // la fletxa segueix la tangent de la via, orientada segons el sentit de marxa
-    let ll = raw, to = [raw[0] + e.vel[0] * 30, raw[1] + e.vel[1] * 30];
-    const snap = snapToLine(e.linea, raw);
-    if (snap && snap.dist < SNAP_MAX_M) {
-      ll = snap.point;
-      let tx = snap.b[0] - snap.a[0], ty = snap.b[1] - snap.a[1];
-      if (e.vel[0] * tx + e.vel[1] * ty < 0) { tx = -tx; ty = -ty; }
-      to = [ll[0] + tx, ll[1] + ty];
+    let ll, tang = null;
+    if (e.sim) {
+      if (e.speed >= MOVE_MIN_MS && dtF > 0) avanzarSim(e, e.speed * dtF);
+      const P = RG[e.linea].paths[e.sim.pi];
+      const pa = pointAt(P, e.sim.arc);
+      ll = pa.pt;
+      tang = e.sim.dir > 0 ? pa.tang : [-pa.tang[0], -pa.tang[1]];
+    } else {
+      ll = e.anchor;               // línia sense ruta: última posició real
+      tang = [e.vel[0], e.vel[1]];
     }
-    e.shown = ll;
     e.marker.setLatLng(ll);
     if (!elm) continue;
     const dot = elm.querySelector(".bus-dot"), arr = elm.querySelector(".bus-arrow");
     if (!dot || !arr) continue;
-    if (e.speed >= MOVE_MIN_MS) {
-      arr.style.transform = `rotate(${bearingScreen(ll, to)}deg)`;
+    if (e.speed >= MOVE_MIN_MS && tang) {
+      arr.style.transform = `rotate(${bearingScreen(ll, [ll[0] + tang[0], ll[1] + tang[1]])}deg)`;
       arr.style.display = "block"; dot.style.display = "none";
     } else {
       arr.style.display = "none"; dot.style.display = "block";
@@ -290,8 +359,13 @@ async function refrescar() {
   try {
     const data = await (await fetch(API + "api/buses?_=" + Date.now(), { cache: "no-store" })).json();
     edadSeg = data.edad_seg == null ? 0 : data.edad_seg;
-    ultimoTs = data.ts || Math.floor(nowSec());
-    actualizarBuses(data, edadSeg);
+    // NOMÉS reajusta la simulació quan arriba una pasada NOVA (ts distint). Si no,
+    // el client demana cada 1 min però la dada canvia cada 5 min: re-enganxar en
+    // cada fetch faria saltar el bus arrere a la posició de fa minuts.
+    if (data.ts && data.ts !== ultimoTs) {
+      ultimoTs = data.ts;
+      actualizarBuses(data, edadSeg);
+    }
     animar();
     const edad = data.edad_seg == null ? "—" : (data.edad_seg < 90 ? data.edad_seg + " s"
       : Math.round(data.edad_seg / 60) + " min");
