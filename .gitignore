@@ -7,3 +7,4 @@ data/*.db-shm
 data/*.log
 data/token.txt
 apk/build/
+data/open_until.txt

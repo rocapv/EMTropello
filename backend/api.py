@@ -32,6 +32,8 @@ WEB = ROOT / "web"
 ROUTES_FILE = ROOT / "data" / "routes.json"
 STOPS_FILE = ROOT / "data" / "stops.json"
 TOKEN_FILE = ROOT / "data" / "token.txt"
+OPEN_UNTIL_FILE = ROOT / "data" / "open_until.txt"   # epoch fins al qual l'accés extern
+                                                     # és lliure (sense token); auto-caduca
 
 app = FastAPI(title="EMTropello", version="0.1")
 
@@ -79,6 +81,15 @@ def _token() -> str:
     return os.environ.get("EMT_TOKEN", "").strip()
 
 
+def _open_until() -> float:
+    """Epoch fins al qual l'accés extern és lliure (sense token). Si el fitxer no
+    existeix o ja ha passat, torna a exigir-se el token. S'auto-caduca."""
+    try:
+        return float(OPEN_UNTIL_FILE.read_text(encoding="utf-8").strip())
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 def _is_lan(ip: str) -> bool:
     return (
         ip in ("127.0.0.1", "::1", "localhost")
@@ -99,7 +110,9 @@ def _client_ip(request: Request) -> str:
 @app.middleware("http")
 async def auth_token(request: Request, call_next):
     q = request.query_params.get("token")
-    if _is_lan(_client_ip(request)):
+    if _is_lan(_client_ip(request)) or time.time() < _open_until():
+        # LAN sempre lliure; a més, finestra temporal d'accés extern obert (sense
+        # token) mentre no caduque open_until.txt.
         resp = await call_next(request)
     else:
         token = _token()
