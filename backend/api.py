@@ -41,6 +41,9 @@ _NET_CACHE: dict | None = None
 MATCH_MAX_M = 3000     # radi per lligar un bus amb la seua posició de la pasada anterior
 MIN_DT_SEC = 40        # la pasada "anterior" ha de ser >= això d'antiga (si no, el GPS
                        # d'EMT no ha refrescat i eixiria velocitat 0 -> tot parat)
+MAX_DT_SEC = 200       # ...i <= això. Emparellar amb una pasada MOLT vella (p. ex. dies,
+                       # després d'un buit sense clients) donava dt enorme -> velocitat ~0
+                       # per a TOTS els busos (quiets). Millor pts=null i esperar un parell fresc.
 
 # --- Pull ON-DEMAND: NO hi ha poller de fons. El geoportal només es consulta quan
 # un client demana /api/buses i la caché ha caducat (~1 min). Sense clients, zero
@@ -145,11 +148,11 @@ def _cur_prev_snapshots(con):
     cur = snaps[0]
     prev = None
     for s in snaps[1:]:
-        if cur["ts"] - s["ts"] >= MIN_DT_SEC:
-            prev = s
-            break
-    if prev is None and len(snaps) > 1:
-        prev = snaps[-1]
+        gap = cur["ts"] - s["ts"]
+        if gap >= MIN_DT_SEC:
+            if gap <= MAX_DT_SEC:      # el primer prou antic; si també és prou recent, l'usem
+                prev = s
+            break                      # si és massa vell, cap serveix (la resta són més vells)
     return cur, prev
 
 
