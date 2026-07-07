@@ -237,6 +237,10 @@ function fmtEdat(fechaMs) {
 function actualizarBuses(data, edad) {
   const busos = data.busos || [];
   const dt = (data.ts && data.pts) ? Math.max(1, data.ts - data.pts) : 0;
+  // antiguitat del GPS de cada bus, RELATIVA al bus més fresc (maxFecha). Així és
+  // immune al rellotge, a la zona horària i al DST (el `fecha` del geoportal ve
+  // ~2h avançat). El bus més fresc -> gps_age 0; els altres, positiu.
+  const maxFecha = busos.reduce((m, x) => Math.max(m, x.fecha || 0), 0);
 
   for (const e of buses) e.usado = false;
   const nuevos = [];
@@ -269,6 +273,15 @@ function actualizarBuses(data, edad) {
       }
       if (speed > MAX_SPEED_MS) speed = 0;                  // emparellament dolent
       sim = { pi: snC.pi, arc: snC.arc, dir };
+      // COMPENSA EL RETARD: es dibuixa on el bus està ARA, no on estava. Retard =
+      // edad (antiguitat del snapshot, la mesura el servidor) + gps_age (com de vell
+      // és el GPS d'este bus respecte al més fresc). Amb topalls (75 s / 400 m) per no
+      // sobrepassar en busos ràpids que freguen o giren; la següent dada ho recorregix.
+      if (speed >= MOVE_MIN_MS && b.fecha) {
+        const gpsAge = (maxFecha - b.fecha) / 1000;
+        const lag = Math.max(0, Math.min(75, edad + gpsAge));
+        if (lag > 1) avanzarSim({ linea: b.linea, sim }, Math.min(speed * lag, 400));
+      }
     } else if (b.plat != null && dt > 0) {
       speed = distM([b.plat, b.plng], anchor) / dt;         // línia sense ruta (nocturnes)
       if (speed > MAX_SPEED_MS) speed = 0;
